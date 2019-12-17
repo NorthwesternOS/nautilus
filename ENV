@@ -1,0 +1,2 @@
+export PATH=$PATH:/home/software/qemu4/bin
+
