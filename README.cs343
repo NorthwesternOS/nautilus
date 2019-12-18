@@ -1,0 +1,11 @@
+To build and run on moore:
+
+ssh -Y you@moore
+
+moore> git clone [assignment]
+moore> cd [assignment]
+moore> source ENV
+moore> cp configs/[assignment config] .config
+moore> make -j 8 isoimage
+moore> ./run
+
