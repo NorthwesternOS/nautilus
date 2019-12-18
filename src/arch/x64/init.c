@@ -103,6 +103,9 @@
 #include <dev/gpio.h>
 #endif
 #include <dev/serial.h>
+#ifdef NAUT_CONFIG_PARPORT
+#include <dev/parport.h>
+#endif
 #include <dev/vga.h>
 #ifdef NAUT_CONFIG_VIRTIO_PCI
 #include <dev/virtio_pci.h>
@@ -478,6 +481,10 @@ init (unsigned long mbd,
     vga_init();
     serial_init();
 
+#ifdef NAUT_CONFIG_PARPORT
+    nk_parport_init();
+#endif
+    
     nk_sched_start();
     
 #ifdef NAUT_CONFIG_FIBER_ENABLE

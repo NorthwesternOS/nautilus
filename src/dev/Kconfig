@@ -42,6 +42,20 @@ config SERIAL_DEBUGGER_PORT
       
 endmenu      
 
+
+config PARPORT
+    bool "Parallel port support"
+    default n
+    help
+       Provide basic legacy parallel port access (CS 343)
+
+config DEBUG_PARPORT
+    bool "Debug parallel port support"
+    depends on PARPORT
+    default n
+    help
+       Enable debugging printouts for parallel port support
+
 config APIC_FORCE_XAPIC_MODE
     bool "Force APIC to use XAPIC mode"
     default n
@@ -180,6 +194,20 @@ config DEBUG_VIRTIO_BLK
     help
       Turn on debug prints for the Virtio Block Driver
 
+config VIRTIO_GPU
+    bool "Virtio GPU"
+    depends on VIRTIO_PCI
+    default n
+    help
+      Adds the Virtio GPU Driver
+
+config DEBUG_VIRTIO_GPU
+    bool "Debug Virtio GPU"
+    depends on DEBUG_PRINTS && VIRTIO_GPU
+    default n
+    help
+      Turn on debug prints for the Virtio GPU Driver
+
 config E1000_PCI
     bool "E1000 PCI NIC Driver"
     depends on X86_64_HOST
@@ -272,6 +300,7 @@ config DEBUG_VESA
     default n
     help
        Add debugging output from VESA driver
+
 
 endmenu
 
