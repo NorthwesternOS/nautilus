@@ -52,17 +52,14 @@
 #include <nautilus/nautilus.h>
 
 
-// eventually this will be gpudev.h
-// - for now we are a generic device
-// - one of your tasks for later is to develop an interface
-//   and define it in your own gpudev.h
-#include <nautilus/dev.h>
-
-
+// we conform to the gpudev interface
+#include <nautilus/gpudev.h>
 
 #include <nautilus/irq.h>
 #include <dev/pci.h>
+#include <dev/vga.h>    // for capture/restore text
 #include <dev/virtio_gpu.h>
+
 
 ///////////////////////////////////////////////////////////////////
 // Wrappers for debug and other output so that
@@ -101,23 +98,6 @@
     }
 
 
-///////////////////////////////////////////////////////////////////
-// We can support multiple virtio-gpu devices - this variable
-// is usd to create an enumeration
-//
-static uint64_t num_devs = 0;
-
-///////////////////////////////////////////////////////////////////
-// The software state of a device
-//
-struct virtio_gpu_dev {
-    struct nk_dev               *gpu_dev;     // we are a generic device
-                                              // eventually, we will have a gpu device abstraction
-    
-    struct virtio_pci_dev       *virtio_dev;  // we are also a virtio pci device
-
-    spinlock_t                   lock;        // we have a lock
-};
 
 
 ///////////////////////////////////////////////////////////////////
@@ -508,6 +488,10 @@ static int interrupt_handler(excp_entry_t *exp, excp_vec_t vec, void *priv_data)
 {
     DEBUG("interrupt invoked\n");
 
+    // EXTRA CREDIT:  MAKE THE DEVICE INTERRUPT DRIVEN!
+    // Your basic device driver will be synchronous, with one
+    // outstanding transaction at time.   Remove these limitations
+    
     // see the parport code for why we must do this
     IRQ_HANDLER_END();
     
@@ -748,65 +732,368 @@ static int transact_rrw(struct virtio_pci_dev *dev,
 }
 
 
+///////////////////////////////////////////////////////////////////
+// We can support multiple virtio-gpu devices - this variable
+// is usd to create an enumeration
+//
+static uint64_t num_devs = 0;
+
+///////////////////////////////////////////////////////////////////
+// The software state of a device
+//
+struct virtio_gpu_dev {
+    struct nk_gpu_dev           *gpu_dev;     // we are a gpu device
+    
+    struct virtio_pci_dev       *virtio_dev;  // we are also a virtio pci device
+
+    spinlock_t                   lock;        // we have a lock
+
+    // data from the last request for modes made of the device
+    int                                 have_disp_info;
+    struct virtio_gpu_resp_display_info disp_info_resp;
+
+    // if cur_mode==0, it means we are in normal text mode
+    // if cur_mode>0, then we are in some graphics mode
+    int                                 cur_mode; // 0 => text, otherwise cur_mode-1 => offset into disp_info_resp
+
+    void                        *frame_buffer;   // will point to your in-memory pixel data
+    nk_gpu_dev_box_t             frame_box;      // a bounding box that describes your framebuffer
+    nk_gpu_dev_box_t             clipping_box;   // a bounding box that restricts drawing
+
+    void                        *cursor_buffer;  // for EC - mouse cursor frame buffer
+    nk_gpu_dev_box_t             cursor_box;     // for EC - bounding box describing mouse cursor frame buffer
+
+    uint16_t                     text_snapshot[80*25];  // so we can save/restore vga text-mode data
+};
+
+
 // helper to zero requests - always a good idea!
 #define ZERO(a) memset(a,0,sizeof(*a))
-
 
 // the resource ids we will use
 // it is important to note that resource id 0 has special
 // meaning - it means "disabled" or "none"
 #define SCREEN_RID 42     // for the whole screen (scanout)
-#define CURSOR_RID 23     // for the cursor (if implemented)
+#define CURSOR_RID 23     // for the mouse cursor (if implemented)
 
 // helper macro to make sure that response we get are quickly and easily checked
 #define CHECK_RESP(h,ok,errstr) if (h.type!=ok) { ERROR(errstr " rc=%x\n",h.type); return -1; }
 
-//
-//
-// Startup testing - switch to graphics mode and draw something on the screen
-//
-static int test_gpu(struct virtio_gpu_dev *gdev)
-{
-    struct virtio_pci_dev *dev = gdev->virtio_dev;
-    
-    // 1. We will need to find what scanouts (monitors) are attached,
-    // and what their resolutions are
+#define DEV_NAME(s) ((s)->gpu_dev->dev.name)
 
-    // Our request/response pair
-    struct virtio_gpu_ctrl_hdr          disp_info_req;
-    struct virtio_gpu_resp_display_info disp_info_resp;
+#define UNIMPL() ERROR("unimplemented\n"); return -1;
+
+
+// gpu device-specific functions
+
+static int update_modes(struct virtio_gpu_dev *d)
+{
+
+    if (d->have_disp_info) {
+	return 0;
+    }
+
+    
+    // Our request/response pair (response stored in device struct)
+    struct virtio_gpu_ctrl_hdr disp_info_req;
 
     // Be paranoid about these things - you want them to start with all zeros
     ZERO(&disp_info_req);
-    ZERO(&disp_info_resp);
+    ZERO(&d->disp_info_resp);
 
     // we are making the get display info request
     disp_info_req.type = VIRTIO_GPU_CMD_GET_DISPLAY_INFO;
 
     // now issue the request via virtqueue
-    if (transact_rw(dev,
-		    0,
-		    &disp_info_req,
-		    sizeof(disp_info_req),
-		    &disp_info_resp,
-		    sizeof(disp_info_resp))) {
-	ERROR("Failed to get display info\n");
-	return -1;
+    if (transact_rw(d->virtio_dev,
+                    0,
+                    &disp_info_req,
+                    sizeof(disp_info_req),
+                    &d->disp_info_resp,
+                    sizeof(d->disp_info_resp)))
+    {
+        ERROR("Failed to get display info\n");
+        return -1;
     }
 
     // If we get here, we have a response, but we don't know if the response is OK
     // ALWAYS CHECK
-    CHECK_RESP(disp_info_resp.hdr,VIRTIO_GPU_RESP_OK_DISPLAY_INFO,"Failed to get display info");
+    CHECK_RESP(d->disp_info_resp.hdr, VIRTIO_GPU_RESP_OK_DISPLAY_INFO, "Failed to get display info");
 
     // now just print out the monitors and their resolutions
-    for (int i = 0; i < 16; i++) {
-	if (disp_info_resp.pmodes[i].enabled) { 
-	    DEBUG("scanout (monitor) %u has info: %u, %u, %ux%u, %u, %u\n", i, disp_info_resp.pmodes[i].r.x, disp_info_resp.pmodes[i].r.y, disp_info_resp.pmodes[i].r.width, disp_info_resp.pmodes[i].r.height, disp_info_resp.pmodes[i].flags, disp_info_resp.pmodes[i].enabled);
-	}
+    for (int i = 0; i < 16; i++)  {
+        if (d->disp_info_resp.pmodes[i].enabled) {
+            DEBUG("scanout (monitor) %u has info: x=%u, y=%u, %u by %u flags=0x%x enabled=%d\n", i,
+		  d->disp_info_resp.pmodes[i].r.x,
+		  d->disp_info_resp.pmodes[i].r.y,
+		  d->disp_info_resp.pmodes[i].r.width,
+		  d->disp_info_resp.pmodes[i].r.height,
+		  d->disp_info_resp.pmodes[i].flags,
+		  d->disp_info_resp.pmodes[i].enabled);
+        }
+    }
+    
+    d->have_disp_info = 1;
+    
+    return 0;
+}
+
+
+static void fill_out_mode(struct virtio_gpu_dev *d, nk_gpu_dev_video_mode_t *mode, int modenum)
+{
+    if (modenum == 0) { 
+	// text mode
+	nk_gpu_dev_video_mode_t m = {
+	    .type = NK_GPU_DEV_MODE_TYPE_TEXT,
+	    .width = 80,
+	    .height = 25,
+	    .channel_offset = { 0, 1, -1, -1 },
+	    .flags = 0,
+	    .mouse_cursor_width = 0,
+	    .mouse_cursor_height = 0,
+	    .mode_data = (void*)(uint64_t)modenum,
+	};
+	*mode = m;
+    } else {
+	nk_gpu_dev_video_mode_t m = {
+	    .type = NK_GPU_DEV_MODE_TYPE_GRAPHICS_2D,
+	    .width = d->disp_info_resp.pmodes[modenum-1].r.width,
+	    .height = d->disp_info_resp.pmodes[modenum-1].r.height,
+	    .flags = NK_GPU_DEV_HAS_MOUSE_CURSOR,
+	    .channel_offset = { 0, 1, 2, 3 },  // BGRA in LE
+	    .mouse_cursor_width = 64,
+	    .mouse_cursor_height = 64,
+	    .mode_data = (void*)(uint64_t)modenum,
+	};
+	*mode = m;
+    }
+}
+    
+	
+// discover the modes supported by the device
+//     modes = array of modes on entry, filled out on return
+//     num = size of array on entry, number of modes found on return
+// 
+static int get_available_modes(void *state,
+			       nk_gpu_dev_video_mode_t modes[],
+			       uint32_t *num)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+
+    DEBUG("get_available_modes on %s\n", DEV_NAME(d));
+
+    if (*num<2) {
+	ERROR("Must provide at least two mode slots\n");
+	return -1;
     }
 
-    // 2. we would create a resource for the screen
+    if (update_modes(d)) {
+	ERROR("Cannot update modes\n");
+	return -1;
+    }
+
+    // now translate modes back to that expected by the abstraction
+    // we will interpret each scanout as a mode, plus add a text mode as well
+    uint32_t limit = *num > 16 ? 15 : *num-1;
+    uint32_t cur=0;
+
+    fill_out_mode(d,&modes[cur++],0);
+
+    // graphics modes
+    for (int i = 0; i < 16 && cur < limit; i++) {
+        if (d->disp_info_resp.pmodes[i].enabled)  {
+	    DEBUG("filling out entry %d with scanout info %d\n",cur,i);
+	    fill_out_mode(d,&modes[cur++],i+1);
+	} 
+    }
+
+    *num = cur;
+
+    return 0;
+}
+
+
+// grab the current mode - useful in case you need to reset it later
+static int get_mode(void *state, nk_gpu_dev_video_mode_t *mode)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
     
+    DEBUG("get_mode on %s\n", DEV_NAME(d));
+
+    fill_out_mode(d,mode,d->cur_mode);
+
+    return 0;
+}
+
+//
+// This function resets the pipeline we have created
+// it is completely written.   Take a look at it
+// to see more examples of how to interact with the device
+// 
+//
+static int reset(struct virtio_gpu_dev *d)
+{
+    if (d->cur_mode) {
+	
+	// detach framebuffer
+	struct virtio_gpu_resource_detach_backing backing_detach_req;
+	struct virtio_gpu_ctrl_hdr                backing_detach_resp;
+	
+	ZERO(&backing_detach_req);
+	ZERO(&backing_detach_resp);
+	
+	backing_detach_req.hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+	backing_detach_req.resource_id = SCREEN_RID;
+
+	if (transact_rw(d->virtio_dev,
+			0,
+			&backing_detach_req,
+			sizeof(backing_detach_req),
+			&backing_detach_resp,
+			sizeof(backing_detach_resp))) {
+	    ERROR("failed to detach screen framebuffer (transaction failed)\n");
+	    return -1;
+	}
+
+	CHECK_RESP(backing_detach_resp, VIRTIO_GPU_RESP_OK_NODATA, "failed to detach screen framebuffer\n");
+
+	DEBUG("detached screen framebuffer\n");
+
+	// unref resource
+	struct virtio_gpu_resource_unref unref_req;
+	struct virtio_gpu_ctrl_hdr       unref_resp;
+
+	ZERO(&unref_req);
+	ZERO(&unref_resp);
+	
+	unref_req.hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+	unref_req.resource_id = SCREEN_RID;
+	
+	if (transact_rw(d->virtio_dev,
+			0,
+			&unref_req,
+			sizeof(unref_req),
+			&unref_resp,
+			sizeof(unref_resp))) {
+	    ERROR("failed to unref screen resource (transaction failed)\n");
+	    return -1;
+	}
+	
+	CHECK_RESP(unref_resp, VIRTIO_GPU_RESP_OK_NODATA, "failed to unref screen resource\n");
+	
+	DEBUG("unreferenced screen resource\n");
+	
+	free(d->frame_buffer);
+	d->frame_buffer=0;
+
+	DEBUG("freed screen framebuffer\n");
+
+	// detach cursor buffer
+	ZERO(&backing_detach_req);
+	ZERO(&backing_detach_resp);
+	
+	backing_detach_req.hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+	backing_detach_req.resource_id = CURSOR_RID;
+
+	if (transact_rw(d->virtio_dev,
+			0,
+			&backing_detach_req,
+			sizeof(backing_detach_req),
+			&backing_detach_resp,
+			sizeof(backing_detach_resp))) {
+	    ERROR("failed to detach cursor framebuffer (transaction failed)\n");
+	    return -1;
+	}
+
+	CHECK_RESP(backing_detach_resp, VIRTIO_GPU_RESP_OK_NODATA, "failed to detach cursor framebuffer\n");
+
+	DEBUG("detached cursor framebuffer\n");
+
+	ZERO(&unref_req);
+	ZERO(&unref_resp);
+	
+	unref_req.hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+	unref_req.resource_id = CURSOR_RID;
+	
+	if (transact_rw(d->virtio_dev,
+			0,
+			&unref_req,
+			sizeof(unref_req),
+			&unref_resp,
+			sizeof(unref_resp))) {
+	    ERROR("failed to unref cursor resource (transaction failed)\n");
+	    return -1;
+	}
+	
+	CHECK_RESP(unref_resp, VIRTIO_GPU_RESP_OK_NODATA, "failed to unref cursor resource\n");
+	
+	DEBUG("unreferenced cursor resource\n");
+	
+	free(d->cursor_buffer);
+	d->cursor_buffer=0;
+
+	DEBUG("freed cursor framebuffer\n");
+	
+	// attempt to reset to VGA text mode
+	DEBUG("reseting device back to VGA compatibility mode (we hope - this will fail on older QEMUs)\n");
+
+	// reset scanouts to disabled
+	virtio_pci_atomic_store(&d->virtio_dev->common->device_status, 0);
+	
+	d->cur_mode = 0;
+	
+    } else {
+	DEBUG("already in VGA compatibility mode (text mode)\n");
+    }
+    
+    return 0;
+}
+
+static int flush(void *state);
+
+// set a video mode based on the modes discovered
+// this will switch to the mode before returning
+static int set_mode(void *state, nk_gpu_dev_video_mode_t *mode)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+    int mode_num = (int)(int64_t)(mode->mode_data);
+
+    DEBUG("set_mode on %s\n", DEV_NAME(d));
+
+    // 1. First, clean up the current mode and get us back to
+    //    the basic text mode
+    
+    if (d->cur_mode==0) {
+	// we are in VGA text mode - capture the text on screen
+	vga_copy_out(d->text_snapshot,80*25*2);
+	DEBUG("copy out of text mode data complete\n");
+    }
+
+    // reset ourselves back to text mode before doing a switch
+    if (reset(d)) {
+	ERROR("Cannot reset device\n");
+	return -1;
+    }
+
+    DEBUG("reset complete\n");
+    
+    if (mode_num==0) {
+	// we are switching back to VGA text mode - restore
+	// the text on the screen
+	vga_copy_in(d->text_snapshot,80*25*2);
+	DEBUG("copy in of text mode data complete\n");
+	DEBUG("switch to text mode complete\n");
+	return 0;
+    }
+
+    // if we got here, we are switching to a graphics mode
+
+    // we are switching to this graphics mode
+    struct virtio_gpu_display_one *pm = &d->disp_info_resp.pmodes[mode_num-1];
+
+    // 2. we next create a resource for the screen
+    //    use SCREEN_RID as the ID
+
     struct virtio_gpu_resource_create_2d create_2d_req;
     struct virtio_gpu_ctrl_hdr           create_2d_resp;
 
@@ -814,21 +1101,36 @@ static int test_gpu(struct virtio_gpu_dev *gdev)
     ZERO(&create_2d_resp);
 
     //
-    // WRITE ME
+    // WRITE ME!
     //
-
-
+    
     // 3. we would create a framebuffer that we can write pixels into
 
-    // this assumes that we want scanout/monitor 0 only
-    uint64_t fb_length = disp_info_resp.pmodes[0].r.width * disp_info_resp.pmodes[0].r.height * 4;
-    uint32_t *framebuffer = malloc(fb_length);
+    uint64_t fb_length = pm->r.width * pm->r.height * 4;
 
-    if (!framebuffer) {
+    d->frame_buffer = malloc(fb_length);
+    
+    if (!d->frame_buffer) {
 	ERROR("failed to allocate framebuffer of length %lu\n",fb_length);
     } else {
 	DEBUG("allocated framebuffer of length %lu\n",fb_length);
     }
+    
+    DEBUG("allocated screen framebuffer of length %lu\n", fb_length);
+    
+    // now create a description of it in a bounding box
+    
+    d->frame_box.x=0;
+    d->frame_box.y=0;
+    d->frame_box.width=pm->r.width;
+    d->frame_box.height=pm->r.height;
+
+    // make the clipping box the entire screen
+    
+    d->clipping_box.x=0;
+    d->clipping_box.y=0;
+    d->clipping_box.width=pm->r.width;
+    d->clipping_box.height=pm->r.height;
 
     // 4. we should probably fill the framebuffer with some initial data
     // A typical driver would fill it with zeros (black screen), but we
@@ -838,12 +1140,12 @@ static int test_gpu(struct virtio_gpu_dev *gdev)
     // WRITE ME
     //
     
+    // 5. Now we need to associate our framebuffer (step 4) with our resource (step 2)
 
-    // 5. Now we need to associate our framebuffer with our resource (step 2)
     struct virtio_gpu_resource_attach_backing backing_req;
     struct virtio_gpu_mem_entry               backing_entry;
     struct virtio_gpu_ctrl_hdr                backing_resp;
-
+    
     ZERO(&backing_req);
     ZERO(&backing_entry);
     ZERO(&backing_resp);
@@ -851,7 +1153,7 @@ static int test_gpu(struct virtio_gpu_dev *gdev)
     //
     // WRITE ME
     //
-
+    
     // 6. Now we need to associate our resource (step 2) with the scanout (step 1)
 
     struct virtio_gpu_set_scanout setso_req;
@@ -864,91 +1166,384 @@ static int test_gpu(struct virtio_gpu_dev *gdev)
     // WRITE ME
     //
 
-    // 7. Now we need to command the GPU to transfer the data from our framebuffer (step 3)
-    // to our resource (step 2)
+    // Now let's capture our mode number to indicate we are done with setup
+    // and make subsequent calls aware of our state
+    //
+    d->cur_mode = mode_num; 
+
+    // Flush the pipeline  (note that you need to write flush!)
+    flush(d);
+
+    // we should now have whatever is in framebuffer on the screen
+
+    //
+    // EC: EXTRA CREDIT STARTS
+    // 
+    
+    // EC: now we will set up the mouse cursor
+
+    // EC: Create a resource for the mouse cursor bitmap
+    //     use ID CURSOR_RID
+    ZERO(&create_2d_req);
+    ZERO(&create_2d_resp);
+
+    //
+    // EC: WRITE ME
+    //
+
+    //
+    // EC: allocate a framebuffer for the mouse cursor
+    //     These are always 64x64
+    fb_length = 64*64*4;
+
+    d->cursor_buffer = malloc(fb_length);
+
+    if (!d->cursor_buffer) {
+        ERROR("failed to allocate cursor framebuffer of length %lu (transaction failed)\n", fb_length);
+	reset(d);
+	return -1;
+    }
+
+    // EC: Now describe the mouse cursor framebuffer
+
+    d->cursor_box.x=0;
+    d->cursor_box.y=0;
+    d->cursor_box.width=64;
+    d->cursor_box.height=64;
+    
+    DEBUG("allocated cursor framebuffer of length %lu\n", fb_length);
+
+    // EC: Now we would fill cursor_buffer with the initial cursor bitmap
+
+    // EC: Next, we would attach cursor_buffer to resource we created
+    
+    ZERO(&backing_req);
+    ZERO(&backing_entry);
+    ZERO(&backing_resp);
+
+    //
+    // EC: WRITE ME
+    //
+
+    // EC: Next, we would move the mouse cursor to the middle of the screen
+    
+    DEBUG("set_mode complete\n");
+    
+    UNIMPL();
+}
+
+// drawing commands
+
+// each of these is asynchronous - the implementation should start the operation
+// but not necessarily finish it.   In particular, nothing needs to be drawn
+// until flush is invoked
+
+// flush - wait until all preceding drawing commands are visible by the user
+static int flush(void *state)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+    
+    DEBUG("flush on %s\n", DEV_NAME(d));
+
+    if (d->cur_mode==0) {
+	DEBUG("ignoring flush for text mode)\n");
+	return 0;
+    }
+
+    struct virtio_gpu_display_one *pm = &d->disp_info_resp.pmodes[d->cur_mode-1];
+
+
+    // First, tell the GPU to DMA from our framebuffer to the resource
     struct virtio_gpu_transfer_to_host_2d xfer_req;
     struct virtio_gpu_ctrl_hdr            xfer_resp;
 
     ZERO(&xfer_req);
     ZERO(&xfer_resp);
-    
+
     //
     // WRITE ME
     //
+    // (simple version: transfer whole framebuffer)
+    // (complex version: transfer only the parts that have changed since that last flush)
 
-
-    // 8. Now we need to command the GPU to render our resource (step 2) onto the scanout
-    // (monitor) (step 6)
+    // Second, tell the GPU to copy from the resource to the screen
     
     struct virtio_gpu_resource_flush flush_req;
     struct virtio_gpu_ctrl_hdr       flush_resp;
 
     ZERO(&flush_req);
     ZERO(&flush_resp);
+
+    //
+    // WRITE ME
+    //
+
+    // User should now see the changes
+
+    return 0;
+}
+
+// text mode drawing commands
+static int text_set_char(void *state, nk_gpu_dev_coordinate_t *location, nk_gpu_dev_char_t *val)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+
+    DEBUG("text_set_char on %s\n", DEV_NAME(d));
+    
+    UNIMPL();
+}
+
+// cursor location in text mode
+static int text_set_cursor(void *state, nk_gpu_dev_coordinate_t *location, uint32_t flags)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+    
+    DEBUG("text_set_cursor on %s\n", DEV_NAME(d));
+    
+    UNIMPL();
+}
+    
+// graphics mode drawing commands
+
+// confine drawing to this box or region
+static int graphics_set_clipping_box(void *state, nk_gpu_dev_box_t *box)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+    
+    DEBUG("graphics_set_clipping_box on %s (%u, %u) (%u, %u)\n", DEV_NAME(d),
+	  box->x,box->y,box->x+box->width, box->y+box->height);
+
+    d->clipping_box = *box;
+
+    return 0;
+}
+    
+static int graphics_set_clipping_region(void *state, nk_gpu_dev_region_t *region)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+
+    DEBUG("graphics_set_clipping_region on %s\n", DEV_NAME(d));
+    
+    UNIMPL();
+}
+
+// Helper function:   is the coordinate within the box?
+static inline int in_box(nk_gpu_dev_box_t *b, nk_gpu_dev_coordinate_t *c)
+{
+    return
+	c->x>=b->x && c->x<(b->x+b->width) &&
+	c->y>=b->y && c->y<(b->y+b->height);
+}
+
+// Helper function:  given a framebuffer, a box describing it, and a coordinate,
+// return pointer to the pixel at the coordinate
+static inline nk_gpu_dev_pixel_t *pixel_ptr(void *fb, nk_gpu_dev_box_t *b, uint32_t x, uint32_t y)
+{
+    return ((nk_gpu_dev_pixel_t*)fb) + y*b->width + x;
+}
+
+// Helper function:  given a framebuffer, a box describing it, and a coordinate,
+// return pointer to the pixel at the coordinate
+static inline nk_gpu_dev_pixel_t *pixel_ptr_coord(void *fb, nk_gpu_dev_box_t *b, nk_gpu_dev_coordinate_t *c)
+{
+    return pixel_ptr(fb,b,c->x,c->y);
+}
+
+// Helper function:  oldpixel = op(oldpixel,newpixel)
+static void apply_with_blit(nk_gpu_dev_pixel_t *oldpixel, nk_gpu_dev_pixel_t *newpixel, nk_gpu_dev_bit_blit_op_t op)
+{
+
+    switch (op) {
+    // 
+    // PERHAPS, WRITE ME - other cases
+    //
+    case  NK_GPU_DEV_BIT_BLIT_OP_COPY:
+	oldpixel->raw = newpixel->raw;
+	break;
+    default:
+	oldpixel->raw = newpixel->raw;
+	break;
+    }
+
+}
+
+static inline int graphics_draw_pixel(void *state, nk_gpu_dev_coordinate_t *location, nk_gpu_dev_pixel_t *pixel)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+
+    DEBUG("graphics_draw_pixel 0x%08x on %s at (%u,%u)\n", pixel->raw, DEV_NAME(d),location->x, location->y);
+
+    //
+    // WRITE ME
+    //
+
+    // location needs to be within the bounding box of the frame buffer
+    // and pixel is only drawn if within the clipping box
+
+    UNIMPL();
+}
+
+static inline int graphics_draw_line(void *state, nk_gpu_dev_coordinate_t *start, nk_gpu_dev_coordinate_t *end, nk_gpu_dev_pixel_t *pixel)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+
+    DEBUG("graphics_draw_line 0x%x on %s from (%u,%u) to (%u,%u)\n", pixel->raw,
+	  DEV_NAME(d),start->x,start->y, end->x, end->y);
+
+    //
+    // WRITE ME
+    //
+
+    // line needs to be within the bounding box of the frame buffer
+    // and only the portion of the line that is within the clipping box
+    // is drawn
+
+    UNIMPL();
+}
+
+static int graphics_draw_poly(void *state, nk_gpu_dev_coordinate_t *coord_list, uint32_t count, nk_gpu_dev_pixel_t *pixel)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+    
+    DEBUG("graphics_draw_poly on %s\n", DEV_NAME(d));
+
+    //
+    // WRITE ME
+    //
+
+    // the poly needs to be within the bounding box of the frame buffer
+    // and only the portion of the poly that is within the clipping box
+    // is drawn
+
+    UNIMPL();
+
+}
+
+    
+static int graphics_fill_box_with_pixel(void *state, nk_gpu_dev_box_t *box, nk_gpu_dev_pixel_t *pixel, nk_gpu_dev_bit_blit_op_t op)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+
+    DEBUG("graphics_fill_box_with_pixel 0x%x on %s with (%u,%u) (%u,%u) op %d\n", pixel->raw,
+	  DEV_NAME(d),box->x,box->y,box->x+box->width,box->y+box->height,op);
+
+    //
+    // WRITE ME
+    //
+
+    // the filled box needs to be within the bounding box of the frame buffer
+    // and only the portion of the box that is within the clipping box
+    // is drawn
+
+    UNIMPL();
+}
+
+static int graphics_fill_box_with_bitmap(void *state, nk_gpu_dev_box_t *box, nk_gpu_dev_bitmap_t *bitmap, nk_gpu_dev_bit_blit_op_t op)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+
+    DEBUG("graphics_fill_box_with_bitmap on %s\n", DEV_NAME(d));
     
     //
     // WRITE ME
     //
 
-    // 9. At this point, you should have a picture on the screen!
+    // copy from the bitmap to the framebuffer, using the op to transform (bitblt)
+    // output pixels need to be within the bounding box of the frame buffer
+    // and only the portion of that is within the clipping box is drawn
 
-    
-    //
-    // ADVANCED TASK A:  Make an animation.   You can do this by modifying the 
-    // pixels in your framebuffer (using regular C code), and then repeating
-    // steps 7 and 8.   In other words doing steps 4, 7, and 8 in a loop will
-    // let you render a sequence of images
-    //
-
-    // ADVANCED TASK B: Change and move the cursor.   To enable the mouse cursor,
-    // you need to repeat steps 2, 3, 4, 5, 7, 8 for a 64x64 pixel framebuffer/resource
-    // these pixels are the cursor image.
-    // To move the cursor, or change its image, you would issue virtio_gpu_update_cursor
-    // requests ****to virtqueue 1****.  
-    
-    DEBUG("done with test\n");
-
-    // HERE YOU SHOULD CAREFULLY UNDO THINGS
-    //  1. detach backing framebuffers from resources
-    //  2. reset all configured scanouts to disabled (resource id 0)
-    //  3. unref all of your resources
-    //  4. free framebuffers and other memory
-    
-    free(framebuffer);
-
-    // attempt to reset to VGA text mode
-    DEBUG("reseting device back to VGA compatibility mode (we hope - this will fail on older QEMUs)\n");
-    
-    virtio_pci_atomic_store(&dev->common->device_status,0);
-
-    return 0;
+    UNIMPL();
 }
 
-
-
-////////////////////////////////////////////////////////
-// Basic device interface functions.
-// Currently, this is a "generic" device, and so
-// there is nothing much that the rest of the kernel
-// can do with it.
-//
-//
-
-static int open(void *state)
+static int graphics_copy_box(void *state, nk_gpu_dev_box_t *source_box, nk_gpu_dev_box_t *dest_box, nk_gpu_dev_bit_blit_op_t op)
 {
-    return 0;  
-}
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
 
-static int close(void *state)
+    DEBUG("graphics_copy_box on %s with (%u,%u) (%u,%u) to (%u, %u) (%u, %u) op %d\n",
+	  DEV_NAME(d),source_box->x,source_box->y,source_box->x+source_box->width,
+	  source_box->y+source_box->height,dest_box->x,dest_box->y,dest_box->x+dest_box->width,
+	  dest_box->y+dest_box->height,op);
+
+    //
+    // WRITE ME
+    //
+
+    // copy from one box in the framebuffer to another using the op to transform (bitblt) 
+    // output pixels need to be within the bounding box of the frame buffer
+    // and only the portion of that is within the clipping box is drawn
+
+    UNIMPL();
+}
+    
+static int graphics_draw_text(void *state, nk_gpu_dev_coordinate_t *location, nk_gpu_dev_font_t *font, char *string)
 {
-    return 0;
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+    
+    DEBUG("graphics_draw_text on %s\n", DEV_NAME(d));
+
+    //
+    // EXTRA CREDIT
+    //
+    
+    UNIMPL();
 }
 
-static struct nk_dev_int ops = {
-    .open = open,
-    .close = close,
+
+//  cursor functions, if supported
+static int graphics_set_cursor_bitmap(void *state, nk_gpu_dev_bitmap_t *bitmap)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+
+    DEBUG("graphics_set_cursor_bitmap on %s\n", DEV_NAME(d));
+
+    //
+    // EXTRA CREDIT
+    //
+    
+    UNIMPL();
+}
+
+// the location is the position of the top-left pixel in the bitmap
+static int graphics_set_cursor(void *state, nk_gpu_dev_coordinate_t *location)
+{
+    struct virtio_gpu_dev *d = (struct virtio_gpu_dev *)state;
+    
+    DEBUG("graphics_set_cursor on %s\n", DEV_NAME(d));
+
+    //
+    // EXTRA CREDIT
+    //
+    
+    UNIMPL();
+}
+
+
+
+// mapping of interface callback functions to our implementations of them
+static struct nk_gpu_dev_int ops = {
+    .get_available_modes = get_available_modes,
+    .get_mode = get_mode,
+    .set_mode = set_mode,
+    
+    .flush = flush,
+    
+    .text_set_char = text_set_char,
+    .text_set_cursor = text_set_cursor,
+
+    .graphics_set_clipping_box = graphics_set_clipping_box,
+    .graphics_set_clipping_region = graphics_set_clipping_region,
+
+    .graphics_draw_pixel = graphics_draw_pixel,
+    .graphics_draw_line = graphics_draw_line,
+    .graphics_draw_poly = graphics_draw_poly,
+    .graphics_fill_box_with_pixel = graphics_fill_box_with_pixel,
+    .graphics_fill_box_with_bitmap = graphics_fill_box_with_bitmap,
+    .graphics_copy_box = graphics_copy_box,
+    .graphics_draw_text = graphics_draw_text,
+
+    .graphics_set_cursor_bitmap = graphics_set_cursor_bitmap,
+    .graphics_set_cursor = graphics_set_cursor,
 };
-
 
 
 ////////////////////////////////////////////////////////
@@ -961,76 +1556,75 @@ static struct nk_dev_int ops = {
 // for device configuration and then registering the
 // device to the rest of the kernel can use it.  The virtio_pci
 // framework provides functions to do the common elements of this
-int virtio_gpu_init(struct virtio_pci_dev *dev)
+int virtio_gpu_init(struct virtio_pci_dev *virtio_dev)
 {
     char buf[DEV_NAME_LEN];
     
     DEBUG("initialize device\n");
     
     // allocate and zero a state structure for this device
-    struct virtio_gpu_dev *d = malloc(sizeof(*d));
-    if (!d) {
+    struct virtio_gpu_dev *dev = malloc(sizeof(*dev));
+    if (!dev) {
 	ERROR("cannot allocate state\n");
 	return -1;
     }
-    memset(d,0,sizeof(*d));
+    memset(dev,0,sizeof(*dev));
 
     // acknowledge to the device that we see it
-    if (virtio_pci_ack_device(dev)) {
+    if (virtio_pci_ack_device(virtio_dev)) {
         ERROR("Could not acknowledge device\n");
-        free(d);
+        free(dev);
         return -1;
     }
 
     // ask the device for what features it supports
-    if (virtio_pci_read_features(dev)) {
+    if (virtio_pci_read_features(virtio_dev)) {
         ERROR("Unable to read device features\n");
-        free(d);
+        free(dev);
         return -1;
     }
 
     // tell the device what features we will support
-    if (virtio_pci_write_features(dev, select_features(dev->feat_offered))) {
+    if (virtio_pci_write_features(virtio_dev, select_features(virtio_dev->feat_offered))) {
         ERROR("Unable to write device features\n");
-        free(d);
+        free(dev);
         return -1;
     }
     
     // initilize the device's virtqs.   The virtio-gpu device
     // has two of them.  The first is for most requests/responses,
     // while the second is for (mouse) cursor updates and movement
-    if (virtio_pci_virtqueue_init(dev)) {
+    if (virtio_pci_virtqueue_init(virtio_dev)) {
 	ERROR("failed to initialize virtqueues\n");
-	free(d);
+	free(dev);
 	return -1;
     }
 
     // associate our state with the general virtio-pci device structure,
     // and vice-versa:
-    dev->state = d;
-    dev->teardown = teardown;    // the function we provide for deletion
-    d->virtio_dev = dev;
+    virtio_dev->state = dev;
+    virtio_dev->teardown = teardown;    // the function we provide for deletion
+    dev->virtio_dev = virtio_dev;
 
     // make sure our lock is in a known state
-    spinlock_init(&d->lock);
+    spinlock_init(&dev->lock);
     
     
     // build a name for this device
     snprintf(buf,DEV_NAME_LEN,"virtio-gpu%u",__sync_fetch_and_add(&num_devs,1));
     
-    // register the device, currently just as a generic device
-    // note that this also creates an association with the generic
-    // device represention elesewhere in the kenrel
-    d->gpu_dev = nk_dev_register(buf,             // our name
-				 NK_DEV_GENERIC,  // generic device
-				 0,               // no flags
-				 &ops,            // our "interface"
-				 d);              // our state			         
+    // register the device as a gpudev
+    // so that other code can use it without knowing
+    // how it works
+    dev->gpu_dev = nk_gpu_dev_register(buf,             // our name
+				       0,               // no flags
+				       &ops,            // our interface
+				       dev);            // our state			         
     
-    if (!d->gpu_dev) {
+    if (!dev->gpu_dev) {
 	ERROR("failed to register block device\n");
-	virtio_pci_virtqueue_deinit(dev);
-	free(d);
+	virtio_pci_virtqueue_deinit(virtio_dev);
+	free(dev);
 	return -1;
     }
     
@@ -1052,11 +1646,11 @@ int virtio_gpu_init(struct virtio_pci_dev *dev)
     // Note that this code will leak badly if interrupts cannot be configured
 
     // grab the pci device aspect of the virtio device
-    struct pci_dev *p = dev->pci_dev;
+    struct pci_dev *pci_dev = virtio_dev->pci_dev;
     uint8_t i;
     ulong_t vec;
     
-    if (dev->itype==VIRTIO_PCI_MSI_X_INTERRUPT) {
+    if (virtio_dev->itype==VIRTIO_PCI_MSI_X_INTERRUPT) {
 	// we assume MSI-X has been enabled on the device
 	// already, that virtqueue setup is done, and
 	// that queue i has been mapped to MSI-X table entry i
@@ -1064,8 +1658,8 @@ int virtio_gpu_init(struct virtio_pci_dev *dev)
 
 	DEBUG("setting up interrupts via MSI-X\n");
 	
-	if (dev->num_virtqs != p->msix.size) {
-	    DEBUG("weird mismatch: numqueues=%u msixsize=%u\n", dev->num_virtqs, p->msix.size);
+	if (virtio_dev->num_virtqs != pci_dev->msix.size) {
+	    DEBUG("weird mismatch: numqueues=%u msixsize=%u\n", virtio_dev->num_virtqs, pci_dev->msix.size);
 	    // continue for now...
 	    // return -1;
 	}
@@ -1073,7 +1667,7 @@ int virtio_gpu_init(struct virtio_pci_dev *dev)
 	// this should really go by virtqueue, not entry
 	// and ideally pulled into a per-queue setup routine
 	// in virtio_pci...
-	uint16_t num_vec = p->msix.size;
+	uint16_t num_vec = pci_dev->msix.size;
         
 	// now fill out the device's MSI-X table
 	for (i=0;i<num_vec;i++) {
@@ -1083,20 +1677,20 @@ int virtio_gpu_init(struct virtio_pci_dev *dev)
 		ERROR("cannot get vector...\n");
 		return -1;
 	    }
-	    // register your handler for that vector
-	    if (register_int_handler(vec, interrupt_handler, d)) {
+	    // register our handler for that vector
+	    if (register_int_handler(vec, interrupt_handler, dev)) {
 		ERROR("failed to register int handler\n");
 		return -1;
 	    }
 	    // set the table entry to point to your handler
-	    if (pci_dev_set_msi_x_entry(p,i,vec,0)) {
+	    if (pci_dev_set_msi_x_entry(pci_dev,i,vec,0)) {
 		ERROR("failed to set MSI-X entry\n");
-		virtio_pci_virtqueue_deinit(dev);
-		free(d);
+		virtio_pci_virtqueue_deinit(virtio_dev);
+		free(dev);
 		return -1;
 	    }
 	    // and unmask it (device is still masked)
-	    if (pci_dev_unmask_msi_x_entry(p,i)) {
+	    if (pci_dev_unmask_msi_x_entry(pci_dev,i)) {
 		ERROR("failed to unmask entry\n");
 		return -1;
 	    }
@@ -1104,36 +1698,20 @@ int virtio_gpu_init(struct virtio_pci_dev *dev)
 	}
 	
 	// unmask entire function
-	if (pci_dev_unmask_msi_x_all(p)) {
+	if (pci_dev_unmask_msi_x_all(pci_dev)) {
 	    ERROR("failed to unmask device\n");
 	    return -1;
 	}
 	
     } else {
-
 	ERROR("This device must operate with MSI-X\n");
 	return -1;
     }
-    
+
     DEBUG("device inited\n");
 
-    // At this point a real driver would be done.   The rest of the kernel
-    // would invoke functions in an abstract gpu framework to find screen resolutions,
-    // switch graphics/text modes, draw, etc.
-    //
-    // However, we do not have such an abstraction.    For part of this lab
-    // you will design one (and maybe implement it)
-    //
-    // To start, we want you to simply drive the GPU here and get it to the point
-    // where you can draw things on the screen, and perhaps move the mouse cursor around
-   
-    if (test_gpu(d)) {
-	ERROR("Test GPU failed\n");
-	return -1;
-    }
-	     
-
-    DEBUG("done\n");
 
     return 0;
 }
+
+
