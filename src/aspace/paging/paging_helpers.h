@@ -221,6 +221,9 @@ typedef union ph_pf_error {
 typedef ph_pf_error_t ph_pf_access_t;
 
 
+#define perm_ok(p,a) paging_helper_permissions_ok((uint64_t*)p,a)
+#define perm_set(p,a) paging_helper_set_permissions((uint64_t*)p,a)
+#define perm_set_highest(p) paging_helper_set_highest_permissions((uint64_t*)p)
 
 // create a new page table hierarchy, returning a cr3e
 // this simply creates an empty PML4T

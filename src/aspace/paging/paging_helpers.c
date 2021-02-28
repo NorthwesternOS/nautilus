@@ -121,8 +121,18 @@ int paging_helper_set_permissions(uint64_t *entry, ph_pf_access_t a)
     return 0;
 }
 
-#define perm_ok(p,a) paging_helper_permissions_ok((uint64_t*)p,a)
-#define perm_set(p,a) paging_helper_set_permissions((uint64_t*)p,a)
+int paging_helper_set_highest_permissions(uint64_t *entry)
+{
+    // all levels treat permissions the same, so we will use the base pte
+    ph_pte_t *p = (ph_pte_t *)entry;
+
+    p->writable = 1;
+    p->user = 1;
+    p->no_exec = 0;
+    return 0;
+}
+
+
 
 int paging_helper_walk(ph_cr3e_t cr3, addr_t vaddr, ph_pf_access_t access_type, uint64_t **entry)
 {
@@ -167,70 +177,143 @@ int paging_helper_walk(ph_cr3e_t cr3, addr_t vaddr, ph_pf_access_t access_type, 
 // bug:  permset at high level needs to be a union the permissions at the lower level...
 // also need to revoke permissions if we remove mappings.
 
-int paging_helper_drill(ph_cr3e_t cr3, addr_t vaddr, addr_t paddr, ph_pf_access_t access_type)
-{
-    //DEBUG("drilling %016lx -> %016lx access=%08x\n", vaddr, paddr, *(uint32_t*)(&access_type));
-    ph_pml4e_t *pml4 = (ph_pml4e_t *)PAGE_NUM_TO_ADDR_4KB(cr3.pml4_base);
-    ph_pml4e_t *pml4e = &pml4[ADDR_TO_PML4_INDEX(vaddr)];
+// int paging_helper_drill(ph_cr3e_t cr3, addr_t vaddr, addr_t paddr, ph_pf_access_t access_type)
+// {
+//     //DEBUG("drilling %016lx -> %016lx access=%08x\n", vaddr, paddr, *(uint32_t*)(&access_type));
+//     ph_pml4e_t *pml4 = (ph_pml4e_t *)PAGE_NUM_TO_ADDR_4KB(cr3.pml4_base);
+//     ph_pml4e_t *pml4e = &pml4[ADDR_TO_PML4_INDEX(vaddr)];
 
    
     
+//     if (pml4e->present) {
+// 	perm_set(pml4e,access_type);
+// 	ph_pdpe_t *pdp = (ph_pdpe_t *)PAGE_NUM_TO_ADDR_4KB(pml4e->pdp_base);
+// 	ph_pdpe_t *pdpe = &pdp[ADDR_TO_PDP_INDEX(vaddr)];
+// 	if (pdpe->present) {
+// 	    perm_set(pdpe,access_type);
+// 	    ph_pde_t *pd = (ph_pde_t *)PAGE_NUM_TO_ADDR_4KB(pdpe->pd_base);
+// 	    ph_pde_t *pde = &pd[ADDR_TO_PD_INDEX(vaddr)];
+// 	    if (pde->present) {
+// 		perm_set(pde,access_type);
+// 		ph_pte_t *pt = (ph_pte_t *)PAGE_NUM_TO_ADDR_4KB(pde->pt_base);
+// 		ph_pte_t *pte = &pt[ADDR_TO_PT_INDEX(vaddr)];
+// 		// does not matter if the PTE is present or not
+// 		// since we are going to update it anyway
+// 		pte->val = 0;
+// 		pte->present = 1;
+// 		perm_set(pte,access_type);
+// 		pte->page_base = ADDR_TO_PAGE_NUM_4KB(paddr);
+// 		return 0;
+// 	    } else {
+// 		// allocate a PT
+// 		ph_pte_t *pt = (ph_pte_t *)ALLOC_PHYSICAL_PAGE();
+// 		if (!pt) {
+// 		    ERROR("Cannot allocate PT\n");
+// 		    return -1;
+// 		}
+//  		memset(pt,0,PAGE_SIZE_4KB);
+// 		pde->present = 1;
+// 		pde->pt_base = ADDR_TO_PAGE_NUM_4KB(pt);
+// 		// try again
+// 		return paging_helper_drill(cr3,vaddr,paddr,access_type);
+// 	    }
+// 	} else {
+// 	    // allocate a PDT
+// 	    ph_pde_t *pd = (ph_pde_t *)ALLOC_PHYSICAL_PAGE();
+// 	    if (!pd) {
+// 		ERROR("Cannot allocate PDT\n");
+// 		return -1;
+// 	    }
+// 	    memset(pd,0,PAGE_SIZE_4KB);
+// 	    pdpe->present = 1;
+// 	    pdpe->pd_base = ADDR_TO_PAGE_NUM_4KB(pd);
+// 	    // try again
+// 	    return paging_helper_drill(cr3,vaddr,paddr,access_type);
+// 	}
+//     } else {
+// 	// allocate a PDPT
+// 	ph_pdpe_t *pdp = (ph_pdpe_t *)ALLOC_PHYSICAL_PAGE();
+// 	if (!pdp) {
+// 	    ERROR("Cannot allocate PDPT\n");
+// 	    return -1;
+// 	}
+// 	memset(pdp,0,PAGE_SIZE_4KB);
+// 	pml4e->present = 1;
+// 	pml4e->pdp_base = ADDR_TO_PAGE_NUM_4KB(pdp);
+// 	// try again
+// 	return paging_helper_drill(cr3,vaddr,paddr,access_type);
+//     }
+// }
+
+int paging_helper_drill(ph_cr3e_t cr3, addr_t vaddr, addr_t paddr, ph_pf_access_t access_type)
+{
+    // DEBUG("Drilling 4KB page %016lx -> %016lx access=%08x\n", vaddr, paddr, *(uint32_t*)(&access_type));
+    ph_pml4e_t *pml4 = (ph_pml4e_t *)PAGE_NUM_TO_ADDR_4KB(cr3.pml4_base);
+    ph_pml4e_t *pml4e = &pml4[ADDR_TO_PML4_INDEX(vaddr)];
+    
     if (pml4e->present) {
-	perm_set(pml4e,access_type);
-	ph_pdpe_t *pdp = (ph_pdpe_t *)PAGE_NUM_TO_ADDR_4KB(pml4e->pdp_base);
-	ph_pdpe_t *pdpe = &pdp[ADDR_TO_PDP_INDEX(vaddr)];
-	if (pdpe->present) {
-	    perm_set(pdpe,access_type);
-	    ph_pde_t *pd = (ph_pde_t *)PAGE_NUM_TO_ADDR_4KB(pdpe->pd_base);
-	    ph_pde_t *pde = &pd[ADDR_TO_PD_INDEX(vaddr)];
-	    if (pde->present) {
-		perm_set(pde,access_type);
-		ph_pte_t *pt = (ph_pte_t *)PAGE_NUM_TO_ADDR_4KB(pde->pt_base);
-		ph_pte_t *pte = &pt[ADDR_TO_PT_INDEX(vaddr)];
-		// does not matter if the PTE is present or not
-		// since we are going to update it anyway
-		pte->val = 0;
-		pte->present = 1;
-		perm_set(pte,access_type);
-		pte->page_base = ADDR_TO_PAGE_NUM_4KB(paddr);
-		return 0;
-	    } else {
-		// allocate a PT
-		ph_pte_t *pt = (ph_pte_t *)ALLOC_PHYSICAL_PAGE();
-		if (!pt) {
-		    ERROR("Cannot allocate PT\n");
-		    return -1;
-		}
- 		memset(pt,0,PAGE_SIZE_4KB);
-		pde->present = 1;
-		pde->pt_base = ADDR_TO_PAGE_NUM_4KB(pt);
-		// try again
-		return paging_helper_drill(cr3,vaddr,paddr,access_type);
-	    }
-	} else {
-	    // allocate a PDT
-	    ph_pde_t *pd = (ph_pde_t *)ALLOC_PHYSICAL_PAGE();
-	    if (!pd) {
-		ERROR("Cannot allocate PDT\n");
-		return -1;
-	    }
-	    memset(pd,0,PAGE_SIZE_4KB);
-	    pdpe->present = 1;
-	    pdpe->pd_base = ADDR_TO_PAGE_NUM_4KB(pd);
-	    // try again
-	    return paging_helper_drill(cr3,vaddr,paddr,access_type);
-	}
+        // perm_set(pml4e,access_type);
+        perm_set_highest(pml4e);
+        ph_pdpe_t *pdp = (ph_pdpe_t *)PAGE_NUM_TO_ADDR_4KB(pml4e->pdp_base);
+        ph_pdpe_t *pdpe = &pdp[ADDR_TO_PDP_INDEX(vaddr)];
+        
+        if (pdpe->present) {
+            // perm_set(pdpe,access_type);
+            perm_set_highest(pdpe);
+            ph_pde_t *pd = (ph_pde_t *)PAGE_NUM_TO_ADDR_4KB(pdpe->pd_base);
+            ph_pde_t *pde = &pd[ADDR_TO_PD_INDEX(vaddr)];
+
+            if (pde->present) {
+                // perm_set(pde,access_type);
+                perm_set_highest(pde);
+                ph_pte_t *pt = (ph_pte_t *)PAGE_NUM_TO_ADDR_4KB(pde->pt_base);
+                ph_pte_t *pte = &pt[ADDR_TO_PT_INDEX(vaddr)];
+                // does not matter if the PTE is present or not
+                // since we are going to update it anyway
+                pte->val = 0;
+                pte->present = 1;
+                perm_set(pte,access_type);
+                pte->page_base = ADDR_TO_PAGE_NUM_4KB(paddr);
+                return 0;
+            } else {
+            // allocate a PT
+                ph_pte_t *pt = (ph_pte_t *)ALLOC_PHYSICAL_PAGE();
+
+                if (!pt) {
+                    ERROR("Cannot allocate PT\n");
+                    return -1;
+                }
+
+                memset(pt,0,PAGE_SIZE_4KB);
+                pde->present = 1;
+                pde->pt_base = ADDR_TO_PAGE_NUM_4KB(pt);
+                // try again
+                return paging_helper_drill(cr3,vaddr,paddr,access_type);
+            }
+        } else {
+            // allocate a PDT
+            ph_pde_t *pd = (ph_pde_t *)ALLOC_PHYSICAL_PAGE();
+            if (!pd) {
+                ERROR("Cannot allocate PDT\n");
+                return -1;
+            }
+            memset(pd,0,PAGE_SIZE_4KB);
+            pdpe->present = 1;
+            pdpe->pd_base = ADDR_TO_PAGE_NUM_4KB(pd);
+            // try again
+            return paging_helper_drill(cr3,vaddr,paddr,access_type);
+        }
     } else {
-	// allocate a PDPT
-	ph_pdpe_t *pdp = (ph_pdpe_t *)ALLOC_PHYSICAL_PAGE();
-	if (!pdp) {
-	    ERROR("Cannot allocate PDPT\n");
-	    return -1;
-	}
-	memset(pdp,0,PAGE_SIZE_4KB);
-	pml4e->present = 1;
-	pml4e->pdp_base = ADDR_TO_PAGE_NUM_4KB(pdp);
-	// try again
-	return paging_helper_drill(cr3,vaddr,paddr,access_type);
+        // allocate a PDPT
+        ph_pdpe_t *pdp = (ph_pdpe_t *)ALLOC_PHYSICAL_PAGE();
+        if (!pdp) {
+            ERROR("Cannot allocate PDPT\n");
+            return -1;
+        }
+        memset(pdp,0,PAGE_SIZE_4KB);
+        pml4e->present = 1;
+        pml4e->pdp_base = ADDR_TO_PAGE_NUM_4KB(pdp);
+        // try again
+        return paging_helper_drill(cr3,vaddr,paddr,access_type);
     }
 }
