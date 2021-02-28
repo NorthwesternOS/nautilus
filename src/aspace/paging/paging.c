@@ -45,6 +45,7 @@
 
 #include "paging_helpers.h"
 
+#define REGION_FORMAT "(VA=0x%p to PA=0x%p, len=%lx, prot=%lx)"
 
 //
 // Add debugging and other optional output to this subsytem
