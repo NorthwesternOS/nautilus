@@ -8,6 +8,7 @@
 #include <nautilus/aspace.h>
 
 #define REGION_FORMAT "(VA=0x%p to PA=0x%p, len=%lx, prot=%lx)"
+#define REGION(r) (r)->va_start, (r)->pa_start, (r)->len_bytes, (r)->protect.flags
 
 
 static int paging_sanity(char *_buf, void* _priv) {
@@ -28,6 +29,7 @@ static int paging_sanity(char *_buf, void* _priv) {
 #define LEN_1GB (0x40000000UL)
 #define LEN_4GB (0x100000000UL)
 
+#define ADDR_1GB ((void *) 0x40000000UL)
 #define ADDR_4GB ((void *) 0x100000000UL)
 #define ADDR_8GB ((void *) 0x200000000UL)
 #define ADDR_12GB ((void *) 0x300000000UL)
@@ -428,7 +430,7 @@ static int paging_sanity(char *_buf, void* _priv) {
 
     nk_aspace_region_t reg;
     reg.va_start = ADDR_16GB; 
-    reg.pa_start = reg.va_start;
+    reg.pa_start = ADDR_1GB;
     reg.len_bytes = LEN_6MB;  
     reg.protect.flags = NK_ASPACE_READ  | NK_ASPACE_EXEC | NK_ASPACE_PIN | NK_ASPACE_KERN ;
     //  reg.protect.flags =  NK_ASPACE_WRITE | NK_ASPACE_EXEC | NK_ASPACE_PIN | NK_ASPACE_KERN | NK_ASPACE_EAGER;
@@ -473,7 +475,8 @@ static int paging_sanity(char *_buf, void* _priv) {
      *  Update region's protection with write access
      * */
     nk_aspace_protection_t prot;
-    prot.flags = NK_ASPACE_READ  | NK_ASPACE_WRITE | NK_ASPACE_EXEC | NK_ASPACE_KERN | NK_ASPACE_EAGER;
+    // prot.flags = NK_ASPACE_READ  | NK_ASPACE_WRITE | NK_ASPACE_EXEC | NK_ASPACE_KERN | NK_ASPACE_EAGER;
+    prot.flags = NK_ASPACE_READ  | NK_ASPACE_WRITE | NK_ASPACE_EXEC | NK_ASPACE_KERN ;
     nk_aspace_protect_region(mas, &reg, &prot);
     reg.protect = prot;
 
