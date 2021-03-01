@@ -45,7 +45,6 @@
 
 #include "paging_helpers.h"
 
-#define REGION_FORMAT "(VA=0x%p to PA=0x%p, len=%lx, prot=%lx)"
 
 //
 // Add debugging and other optional output to this subsytem
@@ -72,6 +71,7 @@
 // graceful printouts of names
 #define ASPACE_NAME(a) ((a)?(a)->aspace->name : "default")
 #define THREAD_NAME(t) ((!(t)) ? "(none)" : (t)->is_idle ? "(idle)" : (t)->name[0] ? (t)->name : "(noname)")
+#define REGION_FORMAT "(VA=0x%p to PA=0x%p, len=%lx, prot=%lx)"
 
 // You probably want some sort of data structure that will let you
 // keep track of the set of regions you are asked to add/remove/change
